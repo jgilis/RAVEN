@@ -139,6 +139,14 @@ else
     formatMode = 'short';
 end
 
+% Extract version from baseURL (e.g., "2.1" from "https://.../DeepLoc-2.1")
+versionMatch = regexp(baseURL, 'DeepLoc-([0-9]+\.[0-9]+)', 'tokens', 'once');
+if isempty(versionMatch)
+    EM = sprintf('Could not extract version from baseURL: %s. Expected format: .../DeepLoc-X.Y', baseURL);
+    dispEM(EM, true);
+end
+deeplocVersion = versionMatch{1};
+
 % Construct submission URL
 urlParts = regexp(baseURL, '^(https?://[^/]+)', 'tokens', 'once');
 if isempty(urlParts)
@@ -149,7 +157,7 @@ domainRoot = urlParts{1};
 submitURL = [domainRoot '/cgi-bin/webface2.cgi'];
 
 if verbose
-    fprintf('Submitting to DeepLoc-2.1...\n');
+    fprintf('Submitting to DeepLoc-%s...\n', deeplocVersion);
     fprintf('  Mode: %s (encode=%s)\n', mode, encodeMode);
     fprintf('  Format: %s\n', formatMode);
 end
@@ -161,8 +169,8 @@ if verbose
     fprintf('  Step 1: Preparing multipart form data...\n');
 end
 
-% Hard-coded form fields (stable, from browser-captured request)
-configfile = '/var/www/services/services/DeepLoc-2.1/webface.cf';
+% Construct configfile path based on version (stable, from browser-captured request)
+configfile = sprintf('/var/www/services/services/DeepLoc-%s/webface.cf', deeplocVersion);
 
 % Read FASTA file as binary
 fid = fopen(fastaFilePath, 'rb');
