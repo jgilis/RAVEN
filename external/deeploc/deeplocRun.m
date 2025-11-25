@@ -1,23 +1,25 @@
 function [csvFilePath, pollURL] = deeplocRun(fastaFilePath, varargin)
 % deeplocRun
-%   Submits protein sequences from a FASTA file to DeepLoc-2.1 webserver
+%   Submits protein sequences from a FASTA file to DeepLoc webserver
 %   and downloads the resulting CSV file with localization predictions.
 %
 % Input:
 %   fastaFilePath     path to FASTA file containing protein sequences
-%   'Mode'            prediction mode: 'high-quality' (default) or 'fast'
+%   'Version'         DeepLoc version: '2.1' (default), '2.0', or '1.0'
 %                     (optional)
+%   'Mode'            prediction mode: 'high-quality' (default) or 'fast'
+%                     (optional, for DeepLoc 2.0/2.1 only)
 %   'Figures'         true if figures should be requested from DeepLoc
-%                     (optional, default false)
+%                     (optional, default false, for DeepLoc 2.0/2.1 only)
+%   'Encoding'        protein encoding: 'profiles' (default) or 'blosum62'
+%                     (optional, for DeepLoc 1.0 only)
 %   'Email'           email address for notification when job completes
 %                     (optional, default: no email)
 %   'OutputDir'       directory to save CSV file (optional, default: same
 %                     directory as FASTA file)
-%   'Timeout'         HTTP request timeout in seconds (optional, default 600)
+%   'Timeout'         HTTP request timeout in seconds (optional, default 900)
 %   'Verbose'         true if progress messages should be printed (optional,
 %                     default true)
-%   'BaseURL'         DeepLoc webserver base URL (optional, default:
-%                     'https://services.healthtech.dtu.dk/services/DeepLoc-2.1')
 %
 % Output:
 %   csvFilePath       full path to downloaded CSV file with DeepLoc results
@@ -25,6 +27,8 @@ function [csvFilePath, pollURL] = deeplocRun(fastaFilePath, varargin)
 %
 % Usage:
 %   [csvFile, pollURL] = deeplocRun('proteins.fasta');
+%   [csvFile, pollURL] = deeplocRun('proteins.fasta', 'Version', '2.0');
+%   [csvFile, pollURL] = deeplocRun('proteins.fasta', 'Version', '1.0', 'Encoding', 'blosum62');
 %   [csvFile, pollURL] = deeplocRun('proteins.fasta', 'Mode', 'fast', ...
 %       'Figures', true, 'Email', 'user@example.com');
 %
@@ -37,30 +41,40 @@ function [csvFilePath, pollURL] = deeplocRun(fastaFilePath, varargin)
 %   2. parseScores(CSV, 'deeploc') → GSS structure
 %   3. predictLocalization(model, GSS, ...) → compartmentalized model
 
+% Valid DeepLoc versions
+validVersions = {'2.1', '2.0', '1.0'};
+
 % Parse optional parameters
 p = inputParser;
+addParameter(p, 'Version', '2.1', @(x) ischar(x) || isstring(x));
 addParameter(p, 'Mode', 'high-quality', @(x) ischar(x) || isstring(x));
 addParameter(p, 'Figures', false, @islogical);
+addParameter(p, 'Encoding', 'profiles', @(x) ischar(x) || isstring(x));
 addParameter(p, 'Email', '', @(x) ischar(x) || isstring(x) || isempty(x));
 addParameter(p, 'OutputDir', '', @(x) ischar(x) || isstring(x) || isempty(x));  % Will be set to FASTA directory if empty
-addParameter(p, 'Timeout', 600, @isnumeric);
+addParameter(p, 'Timeout', 900, @isnumeric);
 addParameter(p, 'Verbose', true, @islogical);
-addParameter(p, 'BaseURL', 'https://services.healthtech.dtu.dk/services/DeepLoc-2.1', @(x) ischar(x) || isstring(x));
 parse(p, varargin{:});
+
+% Get version from parser (allows override via named parameter)
+version = char(p.Results.Version);
+
+% Validate version
+if ~ismember(version, validVersions)
+    EM = sprintf('Version ''%s'' is not supported. Valid versions are: %s', version, strjoin(validVersions, ', '));
+    dispEM(EM, true);
+end
+
+% Construct baseURL from version
+baseURL = sprintf('https://services.healthtech.dtu.dk/services/DeepLoc-%s', version);
 
 mode = char(p.Results.Mode);
 figures = p.Results.Figures;
+encoding = char(p.Results.Encoding);
 email = char(p.Results.Email);
 outputDir = char(p.Results.OutputDir);
 timeout = p.Results.Timeout;
 verbose = p.Results.Verbose;
-baseURL = char(p.Results.BaseURL);
-
-% Validate mode
-if ~ismember(lower(mode), {'fast', 'high-quality'})
-    EM = 'Mode must be either ''fast'' or ''high-quality''';
-    dispEM(EM, true);
-end
 
 % Normalize inputs
 fastaFilePath = convertCharArray(fastaFilePath);
@@ -94,7 +108,7 @@ if verbose
     fprintf('Reading FASTA file: %s\n', fastaFilePath);
 end
 
-% Try to read FASTA file to validate format
+% Try to read FASTA file to validate format and check sequences
 try
     % Try using fastaread if Bioinformatics Toolbox is available
     if exist('fastaread', 'file') == 2
@@ -103,8 +117,40 @@ try
             EM = 'FASTA file appears to be empty';
             dispEM(EM, true);
         end
+        numSequences = numel(sequences);
         if verbose
-            fprintf('  Found %d sequence(s)\n', numel(sequences));
+            fprintf('  Found %d sequence(s)\n', numSequences);
+        end
+        
+        % Check sequence lengths and count
+        shortSequences = false;
+        longSequences = false;
+        for i = 1:numSequences
+            seqLength = length(sequences(i).Sequence);
+            if seqLength < 10
+                shortSequences = true;
+            end
+            if seqLength > 6000
+                longSequences = true;
+            end
+        end
+        
+        % Issue warnings for short/long sequences
+        if shortSequences || longSequences
+            warningMsg = 'Warning: ';
+            if shortSequences && longSequences
+                warningMsg = [warningMsg 'Amino acid sequences shorter than 10 amino acids and longer than 6000 amino acids have been detected. '];
+            elseif shortSequences
+                warningMsg = [warningMsg 'Amino acid sequences shorter than 10 amino acids have been detected. '];
+            else
+                warningMsg = [warningMsg 'Amino acid sequences longer than 6000 amino acids have been detected. '];
+            end
+            warningMsg = [warningMsg 'DeepLoc predictions may be inaccurate for those sequences.'];
+            if verbose
+                fprintf('  %s\n', warningMsg);
+            else
+                dispEM(warningMsg, false);
+            end
         end
     else
         % Simple validation: check if file contains '>' characters
@@ -119,33 +165,87 @@ try
             EM = 'FASTA file does not appear to contain valid FASTA format (no headers starting with ''>'')';
             dispEM(EM, false);
         end
+        
+        % Count sequences by counting '>' characters
+        numSequences = sum(content == '>');
+        if verbose
+            fprintf('  Found %d sequence(s)\n', numSequences);
+        end
+        
+        % For basic validation without fastaread, we can't check sequence lengths easily
+        % So we'll skip the length warnings in this case
     end
 catch ME
     EM = sprintf('Error reading FASTA file: %s', ME.message);
     dispEM(EM, true);
 end
 
-% Map mode parameter to DeepLoc values
-if strcmpi(mode, 'fast')
-    encodeMode = 'Fast';
-else
-    encodeMode = 'Slow';  % 'high-quality' maps to 'Slow'
-end
-
-% Map figures parameter to DeepLoc format values
-if figures
-    formatMode = 'long';
-else
-    formatMode = 'short';
-end
-
 % Extract version from baseURL (e.g., "2.1" from "https://.../DeepLoc-2.1")
+% This must be done early to determine which parameters are valid
 versionMatch = regexp(baseURL, 'DeepLoc-([0-9]+\.[0-9]+)', 'tokens', 'once');
 if isempty(versionMatch)
     EM = sprintf('Could not extract version from baseURL: %s. Expected format: .../DeepLoc-X.Y', baseURL);
     dispEM(EM, true);
 end
 deeplocVersion = versionMatch{1};
+versionMajor = str2double(regexp(deeplocVersion, '^([0-9]+)', 'tokens', 'once'));
+
+% Validate parameters based on version
+if versionMajor >= 2
+    % DeepLoc 2.0/2.1: validate Mode
+    if ~ismember(lower(mode), {'fast', 'high-quality'})
+        EM = 'Mode must be either ''fast'' or ''high-quality'' (for DeepLoc 2.0/2.1)';
+        dispEM(EM, true);
+    end
+else
+    % DeepLoc 1.0: validate Encoding
+    if ~ismember(lower(encoding), {'profiles', 'blosum62'})
+        EM = 'Encoding must be either ''profiles'' or ''blosum62'' (for DeepLoc 1.0)';
+        dispEM(EM, true);
+    end
+end
+
+% Validate sequence count based on version and encoding
+if exist('numSequences', 'var')
+    maxSequences = 500;  % Default maximum
+    if versionMajor < 2 && strcmpi(encoding, 'profiles')
+        % DeepLoc 1.0 with Profiles encoding: maximum 50 sequences
+        maxSequences = 50;
+    end
+    
+    if numSequences > maxSequences
+        if versionMajor < 2 && strcmpi(encoding, 'profiles')
+            EM = sprintf('FASTA file contains %d sequences, but DeepLoc 1.0 with Profiles encoding allows a maximum of 50 sequences. Please reduce the number of sequences or use BLOSUM62 encoding (allows up to 500 sequences).', numSequences);
+        else
+            EM = sprintf('FASTA file contains %d sequences, but DeepLoc allows a maximum of %d sequences. Please reduce the number of sequences.', numSequences, maxSequences);
+        end
+        dispEM(EM, true);
+    end
+end
+
+% Map parameters to DeepLoc values based on version
+if versionMajor >= 2
+    % DeepLoc 2.0/2.1: Map mode parameter to DeepLoc values
+    if strcmpi(mode, 'fast')
+        encodeMode = 'Fast';
+    else
+        encodeMode = 'Slow';  % 'high-quality' maps to 'Slow'
+    end
+    
+    % Map figures parameter to DeepLoc format values
+    if figures
+        formatMode = 'long';
+    else
+        formatMode = 'short';
+    end
+else
+    % DeepLoc 1.0: Map encoding parameter (values must be uppercase)
+    if strcmpi(encoding, 'blosum62')
+        encodingMode = 'BLOSUM62';
+    else
+        encodingMode = 'PROFILES';  % 'profiles' is default, uppercase for 1.0
+    end
+end
 
 % Construct submission URL
 urlParts = regexp(baseURL, '^(https?://[^/]+)', 'tokens', 'once');
@@ -158,8 +258,12 @@ submitURL = [domainRoot '/cgi-bin/webface2.cgi'];
 
 if verbose
     fprintf('Submitting to DeepLoc-%s...\n', deeplocVersion);
-    fprintf('  Mode: %s (encode=%s)\n', mode, encodeMode);
-    fprintf('  Format: %s\n', formatMode);
+    if versionMajor >= 2
+        fprintf('  Mode: %s (encode=%s)\n', mode, encodeMode);
+        fprintf('  Format: %s\n', formatMode);
+    else
+        fprintf('  Encoding: %s\n', encodingMode);
+    end
 end
 
 % ============================================================================
@@ -205,19 +309,27 @@ bodyParts{end+1} = sprintf('Content-Disposition: form-data; name="configfile"\r\
 bodyParts{end+1} = sprintf('\r\n');
 bodyParts{end+1} = sprintf('%s\r\n', configfile);
 
-% Part 2: encode
-bodyParts{end+1} = sprintf('--%s\r\n', boundary);
-bodyParts{end+1} = sprintf('Content-Disposition: form-data; name="encode"\r\n');
-bodyParts{end+1} = sprintf('\r\n');
-bodyParts{end+1} = sprintf('%s\r\n', encodeMode);
+% Part 2: Version-specific parameters (order matters for DeepLoc 1.0)
+if versionMajor >= 2
+    % DeepLoc 2.0/2.1: encode and format
+    bodyParts{end+1} = sprintf('--%s\r\n', boundary);
+    bodyParts{end+1} = sprintf('Content-Disposition: form-data; name="encode"\r\n');
+    bodyParts{end+1} = sprintf('\r\n');
+    bodyParts{end+1} = sprintf('%s\r\n', encodeMode);
+    
+    bodyParts{end+1} = sprintf('--%s\r\n', boundary);
+    bodyParts{end+1} = sprintf('Content-Disposition: form-data; name="format"\r\n');
+    bodyParts{end+1} = sprintf('\r\n');
+    bodyParts{end+1} = sprintf('%s\r\n', formatMode);
+else
+    % DeepLoc 1.0: empty "fasta" field (for pasted sequences, must be before uploadfile)
+    bodyParts{end+1} = sprintf('--%s\r\n', boundary);
+    bodyParts{end+1} = sprintf('Content-Disposition: form-data; name="fasta"\r\n');
+    bodyParts{end+1} = sprintf('\r\n');
+    bodyParts{end+1} = sprintf('\r\n');  % Empty field
+end
 
-% Part 3: format
-bodyParts{end+1} = sprintf('--%s\r\n', boundary);
-bodyParts{end+1} = sprintf('Content-Disposition: form-data; name="format"\r\n');
-bodyParts{end+1} = sprintf('\r\n');
-bodyParts{end+1} = sprintf('%s\r\n', formatMode);
-
-% Part 4: uploadfile (binary file)
+% Part 3: uploadfile (binary file)
 bodyParts{end+1} = sprintf('--%s\r\n', boundary);
 bodyParts{end+1} = sprintf('Content-Disposition: form-data; name="uploadfile"; filename="%s"\r\n', fastaFileNameFull);
 bodyParts{end+1} = sprintf('Content-Type: application/octet-stream\r\n');
@@ -233,14 +345,30 @@ bodyUint8 = uint8(bodyChar);
 if size(bodyUint8, 1) > 1
     bodyUint8 = bodyUint8';
 end
+
 % Insert binary file data before the closing boundary
 % Find position of last boundary (before --boundary--)
 closingBoundaryPos = length(bodyUint8) - length(sprintf('--%s--\r\n', boundary)) + 1;
 % Ensure all parts are row vectors before concatenation
 bodyUint8 = [bodyUint8(1:closingBoundaryPos-1), fastaFileData(:)', bodyUint8(closingBoundaryPos:end)];
 
+% For DeepLoc 1.0, add encode field AFTER file data but BEFORE closing boundary
+if versionMajor < 2
+    % DeepLoc 1.0: encode field (same name as 2.0/2.1, but different values)
+    % Values are "PROFILES" or "BLOSUM62" (uppercase)
+    % Insert this right before the closing boundary
+    encodeField = sprintf('--%s\r\nContent-Disposition: form-data; name="encode"\r\n\r\n%s\r\n', boundary, encodingMode);
+    encodeFieldUint8 = uint8(encodeField);
+    if size(encodeFieldUint8, 1) > 1
+        encodeFieldUint8 = encodeFieldUint8';
+    end
+    % Insert encode field before closing boundary
+    closingBoundaryPos = length(bodyUint8) - length(sprintf('--%s--\r\n', boundary)) + 1;
+    bodyUint8 = [bodyUint8(1:closingBoundaryPos-1), encodeFieldUint8, bodyUint8(closingBoundaryPos:end)];
+end
+
 if verbose
-    fprintf('    Multipart body constructed (%d bytes)\n', length(bodyUint8));
+    fprintf('    Data prepared for submission (%d bytes)\n', length(bodyUint8));
 end
 
 % ============================================================================
@@ -328,7 +456,6 @@ try
         
         if verbose
             fprintf('    Extracted jobid: %s\n', jobId);
-            fprintf('    Wait time: %d seconds\n', waitTime);
         end
         
     else
@@ -424,7 +551,8 @@ pollCount = 0;
 
 while elapsedTime < maxPollTime && isempty(csvURL)
     pollCount = pollCount + 1;
-    if verbose
+    % Print elapsed time every 30 seconds
+    if verbose && (mod(elapsedTime, 30) == 0 || pollCount == 1)
         fprintf('    Polling job status (attempt %d, elapsed: %d seconds)...\n', pollCount, elapsedTime);
     end
     
@@ -466,7 +594,6 @@ while elapsedTime < maxPollTime && isempty(csvURL)
             csvURL = [baseURL '/tmp/' jobId '/results_' jobId '.csv'];
             if verbose
                 fprintf('    Detected job completion: Found "%s"\n', completionIndicator);
-                fprintf('    Constructed CSV URL from job ID: %s\n', csvURL);
             end
         end
         
@@ -539,10 +666,6 @@ csvFilename = sprintf('deeploc_%s_%s.csv', fastaName, timestamp);
 csvFilePath = fullfile(outputDir, csvFilename);
 
 % Save CSV file
-if verbose
-    fprintf('Saving CSV file: %s\n', csvFilePath);
-end
-
 try
     fid = fopen(csvFilePath, 'w');
     if fid == -1
