@@ -1,4 +1,4 @@
-function [csvFilePath, pollURL] = deeplocRun(fastaFilePath, varargin)
+function [csvFilePath, pollURL] = deeplocRun_old(fastaFilePath, varargin)
 % deeplocRun
 %   Submits protein sequences from a FASTA file to DeepLoc webserver
 %   and downloads the resulting CSV file with localization predictions.

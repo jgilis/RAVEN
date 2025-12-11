@@ -211,12 +211,8 @@ if verbose
     fprintf('  Step 1: Preparing multipart form data...\n');
 end
 
-% Construct configfile path (stable, from browser-captured request)
+% Construct configfile path
 configfile = '/var/www/services/services/DeepLocPro-1.0/webface.cf';
-
-% Note: DeepLocPro uses pasted FASTA sequences in the "fasta" field,
-% not file upload, so we don't need to read the file as binary here.
-% The FASTA content will be read as text and inserted into the "fasta" field.
 
 % Generate random boundary string
 boundary = ['----MATLABFormBoundary', char(randi([65 90], 1, 16))];
@@ -294,25 +290,6 @@ if verbose
     fprintf('    Data prepared for submission (%d bytes)\n', length(bodyUint8));
 end
 
-% Debug: Save request body to file for inspection (ALWAYS, even if verbose is off)
-ravenPath = findRAVENroot();
-debugFile = fullfile(ravenPath, 'temp', 'deeplocpro_post_request.txt');
-debugDir = fileparts(debugFile);
-if ~isfolder(debugDir)
-    mkdir(debugDir);
-end
-try
-    fid = fopen(debugFile, 'w');
-    if fid ~= -1
-        fprintf(fid, '%s', char(bodyUint8));
-        fclose(fid);
-        if verbose
-            fprintf('    Debug: Request body saved to: %s\n', debugFile);
-        end
-    end
-catch
-    % Don't fail if debug file can't be written
-end
 
 % ============================================================================
 % STEP 2: Submit POST request and capture 302 redirect with jobid
@@ -350,18 +327,6 @@ try
     
     if verbose
         fprintf('    POST request completed (status: %d)\n', response.StatusCode);
-    end
-    
-    % Debug: Always save response info (even if verbose is off)
-    debugResponseFile = fullfile(ravenPath, 'temp', 'deeplocpro_post_response_info.txt');
-    fid = fopen(debugResponseFile, 'w');
-    if fid ~= -1
-        fprintf(fid, 'Status Code: %d\n\n', response.StatusCode);
-        fprintf(fid, 'Response Headers:\n');
-        if ~isempty(response.Header)
-            fprintf(fid, '%s\n', char(response.Header));
-        end
-        fclose(fid);
     end
     
     % Check for 302 redirect
@@ -427,23 +392,12 @@ try
             responseBody = char(response.Body);
         end
         
-        % Save response body for debugging
-        debugResponseFile = fullfile(ravenPath, 'temp', 'deeplocpro_post_response.html');
-        fid = fopen(debugResponseFile, 'w');
-        if fid ~= -1
-            fprintf(fid, '%s', responseBody);
-            fclose(fid);
-            if verbose
-                fprintf('    Debug: Response body saved to: %s\n', debugResponseFile);
-            end
-        end
-        
         if contains(responseBody, 'Jobid not provided', 'IgnoreCase', true) || ...
            contains(responseBody, 'WebfaceConfigError', 'IgnoreCase', true)
             EM = sprintf('Server returned error (status %d): %s', response.StatusCode, responseBody);
             dispEM(EM, true);
         else
-            EM = sprintf('Unexpected response status: %d (expected 302 redirect). Response saved to: %s', response.StatusCode, debugResponseFile);
+            EM = sprintf('Unexpected response status: %d (expected 302 redirect)', response.StatusCode);
             dispEM(EM, true);
         end
     end
@@ -531,14 +485,10 @@ while elapsedTime < maxPollTime && isempty(csvURL)
             pollHtml = char(pollHtml);
         end
         
-        % Check if job is complete and extract CSV URL from HTML
-        % DeepLocPro uses a date-time suffix in the CSV filename: results_YYYYMMDD-HHMMSS.csv
-        % So we need to extract the actual URL from the HTML rather than constructing it
+        % Check if job is complete and extract CSV URL from JSON endpoint
         csvURL = '';
         jobComplete = false;
         completionIndicator = '';
-        
-        % Check for indicators that the job is complete (results page is displayed)
         
         % Check for completion indicators (case-insensitive)
         if contains(pollHtml, 'Download prediction results', 'IgnoreCase', true)
@@ -555,251 +505,35 @@ while elapsedTime < maxPollTime && isempty(csvURL)
             completionIndicator = 'Finished prediction';
         end
         
-        % Debug: Save polling HTML when job is complete (for inspection)
         if jobComplete
-            debugPollFile = fullfile(ravenPath, 'temp', sprintf('deeplocpro_poll_complete_%s.html', jobId));
-            fid = fopen(debugPollFile, 'w');
-            if fid ~= -1
-                fprintf(fid, '%s', pollHtml);
-                fclose(fid);
-                if verbose
-                    fprintf('    Debug: Complete polling HTML saved to: %s\n', debugPollFile);
-                end
-            end
-        end
-        
-        if jobComplete
-            % Job is complete - extract CSV URL from HTML
-            % Try multiple patterns to find the CSV download link
+            % Job is complete - extract CSV URL from JSON endpoint
+            % Fetch JSON data from known endpoints to get the CSV file URL
+            jsonEndpoints = {
+                [baseURL '/tmp/' jobId '/results.json'],
+                [baseURL '/tmp/' jobId '/data.json'],
+                [domainRoot '/services/DeepLocPro-1.0/tmp/' jobId '/results.json'],
+                [domainRoot '/services/DeepLocPro-1.0/tmp/' jobId '/data.json']
+            };
             
-            % Pattern 1: Look for CSV URL with date-time pattern (results_YYYYMMDD-HHMMSS.csv)
-            % Try both with and without escaping the jobId (in case it has special regex chars)
-            jobIdEscaped = regexptranslate('escape', jobId);
-            csvPattern = ['/services/DeepLocPro-1\.0/tmp/' jobIdEscaped '/results_\d{8}-\d{6}\.csv'];
-            csvMatches = regexp(pollHtml, csvPattern, 'match', 'once');
-            if ~isempty(csvMatches)
-                csvURL = csvMatches;
-                % Make absolute URL if relative
-                if ~startsWith(csvURL, 'http')
-                    csvURL = ['https://services.healthtech.dtu.dk' csvURL];
-                end
-                if verbose
-                    fprintf('    Found CSV URL (Pattern 1 - date-time): %s\n', csvURL);
-                end
-            end
-            
-            % Pattern 2: Look for CSV link in <a> tags with href (more flexible)
-            if isempty(csvURL)
-                % Try various href patterns
-                hrefPatterns = {
-                    ['href=["'']([^"'']*DeepLocPro-1\.0/tmp/' jobIdEscaped '/results_[^"'']*\.csv[^"'']*)["'']'],  % Standard href with quotes
-                    ['href=([^>\s]+results_[^>\s]+\.csv)'],  % Simple href without quotes
-                    ['href=["'']?([^"'']*results_\d{8}-\d{6}\.csv[^"'']*)["'']?'],  % Date-time pattern in href
-                    ['href=["'']?([^"'']*tmp/' jobIdEscaped '/results_[^"'']*\.csv[^"'']*)["'']?']  % Flexible tmp path
-                };
-                for p = 1:length(hrefPatterns)
-                    hrefMatches = regexp(pollHtml, hrefPatterns{p}, 'tokens', 'once', 'ignorecase');
-                    if ~isempty(hrefMatches)
-                        csvURL = hrefMatches{1};
-                        % Clean up the URL (remove any trailing characters that shouldn't be there)
-                        csvURL = regexprep(csvURL, '[^/\.csv].*$', '');
-                        % Make absolute URL if relative
+            for e = 1:length(jsonEndpoints)
+                try
+                    jsonData = webread(jsonEndpoints{e}, weboptions('Timeout', 10));
+                    if isstruct(jsonData) && isfield(jsonData, 'csv_file')
+                        csvURL = jsonData.csv_file;
                         if ~startsWith(csvURL, 'http')
                             if startsWith(csvURL, '/')
-                                csvURL = ['https://services.healthtech.dtu.dk' csvURL];
-                            elseif contains(csvURL, 'DeepLocPro-1.0') || contains(csvURL, 'tmp/')
                                 csvURL = ['https://services.healthtech.dtu.dk' csvURL];
                             else
                                 csvURL = [baseURL '/' csvURL];
                             end
                         end
                         if verbose
-                            fprintf('    Found CSV URL (Pattern 2 - href, variant %d): %s\n', p, csvURL);
+                            fprintf('    Found CSV URL from JSON endpoint %d: %s\n', e, csvURL);
                         end
                         break;
                     end
-                end
-            end
-            
-            % Pattern 3: Try to fetch JSON data from a known endpoint
-            % DeepLocPro might serve JSON data at /tmp/{jobId}/results.json or similar
-            if isempty(csvURL)
-                jsonEndpoints = {
-                    [baseURL '/tmp/' jobId '/results.json'],
-                    [baseURL '/tmp/' jobId '/data.json'],
-                    [domainRoot '/services/DeepLocPro-1.0/tmp/' jobId '/results.json'],
-                    [domainRoot '/services/DeepLocPro-1.0/tmp/' jobId '/data.json']
-                };
-                for e = 1:length(jsonEndpoints)
-                    try
-                        jsonData = webread(jsonEndpoints{e}, weboptions('Timeout', 10));
-                        if isstruct(jsonData) && isfield(jsonData, 'csv_file')
-                            csvURL = jsonData.csv_file;
-                            if ~startsWith(csvURL, 'http')
-                                if startsWith(csvURL, '/')
-                                    csvURL = ['https://services.healthtech.dtu.dk' csvURL];
-                                else
-                                    csvURL = [baseURL '/' csvURL];
-                                end
-                            end
-                            if verbose
-                                fprintf('    Found CSV URL (Pattern 3 - JSON endpoint %d): %s\n', e, csvURL);
-                            end
-                            break;
-                        end
-                    catch
-                        % Endpoint doesn't exist or failed, continue
-                    end
-                end
-            end
-            
-            % Pattern 4: Extract csv_file from AngularJS template using regex
-            % The HTML contains: ng-href="{{ JSON.csv_file }}" - try to extract the value
-            if isempty(csvURL)
-                % Look for JSON.csv_file in the HTML (might be in a script tag or inline)
-                csvFilePatterns = {
-                    ['JSON\.csv_file["'']?\s*[:=]\s*["'']([^"'']+results_[^"'']+\.csv[^"'']*)["'']'],  % JSON.csv_file = "..."
-                    ['["'']csv_file["'']\s*:\s*["'']([^"'']+results_[^"'']+\.csv[^"'']*)["'']'],  % "csv_file": "..."
-                    ['csv_file["'']?\s*[:=]\s*["'']([^"'']+results_[^"'']+\.csv[^"'']*)["'']']  % csv_file = "..."
-                };
-                for p = 1:length(csvFilePatterns)
-                    csvFileMatches = regexp(pollHtml, csvFilePatterns{p}, 'tokens', 'once', 'ignorecase');
-                    if ~isempty(csvFileMatches)
-                        csvURL = csvFileMatches{1};
-                        if ~startsWith(csvURL, 'http')
-                            if startsWith(csvURL, '/')
-                                csvURL = ['https://services.healthtech.dtu.dk' csvURL];
-                            elseif contains(csvURL, 'DeepLocPro-1.0') || contains(csvURL, 'tmp/')
-                                csvURL = ['https://services.healthtech.dtu.dk' csvURL];
-                            else
-                                csvURL = [baseURL '/' csvURL];
-                            end
-                        end
-                        if verbose
-                            fprintf('    Found CSV URL (Pattern 4 - AngularJS template, variant %d): %s\n', p, csvURL);
-                        end
-                        break;
-                    end
-                end
-            end
-            
-            % Pattern 5: Extract date-time from HTML and construct URL
-            % If we can find the date-time pattern somewhere in the HTML, construct the URL
-            if isempty(csvURL)
-                dateTimePattern = 'results_(\d{8}-\d{6})\.csv';
-                dateTimeMatches = regexp(pollHtml, dateTimePattern, 'tokens', 'once');
-                if ~isempty(dateTimeMatches)
-                    dateTime = dateTimeMatches{1};
-                    % Construct the CSV URL from jobId and dateTime
-                    csvURL = [baseURL '/tmp/' jobId '/results_' dateTime '.csv'];
-                    if verbose
-                        fprintf('    Constructed CSV URL from date-time pattern: %s\n', csvURL);
-                    end
-                end
-            end
-            
-            % Pattern 6: Look for any results_*.csv in the tmp directory (most flexible)
-            if isempty(csvURL)
-                resultsPattern = ['/services/DeepLocPro-1\.0/tmp/' jobIdEscaped '/results_[^"\s''<>]+\.csv'];
-                resultsMatches = regexp(pollHtml, resultsPattern, 'match', 'once');
-                if ~isempty(resultsMatches)
-                    csvURL = resultsMatches;
-                    % Make absolute URL if relative
-                    if ~startsWith(csvURL, 'http')
-                        csvURL = ['https://services.healthtech.dtu.dk' csvURL];
-                    end
-                    if verbose
-                        fprintf('    Found CSV URL (Pattern 4 - flexible): %s\n', csvURL);
-                    end
-                end
-            end
-            
-            % Pattern 7: Look for CSV in JSON data (like DeepLoc)
-            if isempty(csvURL)
-                % Look for JSON data in script tags
-                jsonPattern = '(?:var\s+)?JSON\s*=\s*(\{.*?\});';
-                jsonMatches = regexp(pollHtml, jsonPattern, 'tokens', 'once', 'dotexceptnewline');
-                if ~isempty(jsonMatches)
-                    try
-                        jsonStr = jsonMatches{1};
-                        jsonStr = regexprep(jsonStr, '//.*?\n', '');
-                        jsonStr = regexprep(jsonStr, '/\*.*?\*/', '');
-                        jsonData = jsondecode(jsonStr);
-                        if isfield(jsonData, 'csv_file')
-                            csvURL = jsonData.csv_file;
-                            if ~startsWith(csvURL, 'http')
-                                if startsWith(csvURL, '/')
-                                    csvURL = ['https://services.healthtech.dtu.dk' csvURL];
-                                else
-                                    csvURL = [baseURL '/' csvURL];
-                                end
-                            end
-                            if verbose
-                                fprintf('    Found CSV URL (Pattern 7 - JSON): %s\n', csvURL);
-                            end
-                        end
-                    catch
-                        % JSON parsing failed, continue
-                    end
-                end
-            end
-            
-            % Pattern 8: Try to fetch JSON from the polling URL with different parameters
-            % The JSON might be available at the same URL with ?format=json or similar
-            if isempty(csvURL)
-                pollURLBase = regexprep(pollURL, '\?.*$', '');
-                jsonPollURLs = {
-                    [pollURL '&format=json'],
-                    [pollURLBase '?format=json&jobid=' jobId '&wait=' num2str(waitTime)],
-                    [domainRoot '/services/DeepLocPro-1.0/tmp/' jobId '/results.json'],
-                    [domainRoot '/services/DeepLocPro-1.0/tmp/' jobId '/data.json']
-                };
-                for u = 1:length(jsonPollURLs)
-                    try
-                        jsonData = webread(jsonPollURLs{u}, weboptions('Timeout', 10));
-                        if isstruct(jsonData) && isfield(jsonData, 'csv_file')
-                            csvURL = jsonData.csv_file;
-                            if ~startsWith(csvURL, 'http')
-                                if startsWith(csvURL, '/')
-                                    csvURL = ['https://services.healthtech.dtu.dk' csvURL];
-                                else
-                                    csvURL = [baseURL '/' csvURL];
-                                end
-                            end
-                            if verbose
-                                fprintf('    Found CSV URL (Pattern 8 - JSON from polling URL variant %d): %s\n', u, csvURL);
-                            end
-                            break;
-                        end
-                    catch
-                        % Endpoint doesn't exist or failed, continue
-                    end
-                end
-            end
-            
-            % Pattern 9: Last resort - try to construct URL from timestamps around job completion
-            % Try current time and go back up to 30 minutes in 1-minute increments
-            if isempty(csvURL)
-                found = false;
-                for minutesBack = 0:30
-                    testDateTime = datestr(now - minutesBack/(24*60), 'yyyymmdd-HHMMSS');
-                    testURL = [baseURL '/tmp/' jobId '/results_' testDateTime '.csv'];
-                    try
-                        % Try to HEAD the file to see if it exists
-                        options = weboptions('RequestMethod', 'head', 'Timeout', 5);
-                        webread(testURL, options);
-                        csvURL = testURL;
-                        if verbose
-                            fprintf('    Found CSV URL (Pattern 9 - timestamp %d min ago): %s\n', minutesBack, csvURL);
-                        end
-                        found = true;
-                        break;
-                    catch
-                        % File doesn't exist with this timestamp, continue
-                    end
-                end
-                if ~found && verbose
-                    fprintf('    Pattern 9: Tried timestamps from now to 30 minutes ago, no CSV file found\n');
+                catch
+                    % Endpoint doesn't exist or failed, continue to next
                 end
             end
             
@@ -808,10 +542,9 @@ while elapsedTime < maxPollTime && isempty(csvURL)
                     fprintf('    Detected job completion: Found "%s"\n', completionIndicator);
                 end
             else
-                % If we can't find the CSV URL, save HTML for debugging
+                % If we can't find the CSV URL
                 if verbose
-                    fprintf('    Detected job completion: Found "%s" but could not extract CSV URL from HTML\n', completionIndicator);
-                    fprintf('    Debug: Please check the saved HTML file: %s\n', debugPollFile);
+                    fprintf('    Detected job completion: Found "%s" but could not extract CSV URL from JSON endpoints\n', completionIndicator);
                 end
             end
         end
